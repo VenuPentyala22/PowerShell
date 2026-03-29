@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Collects vCPU quota availability across all Azure subscriptions
+    Collects vCPU quota availability for eastus and eastus2 across all Azure subscriptions
     and uploads a timestamped CSV to Azure Blob Storage.
 
 .REQUIREMENTS
@@ -11,10 +11,10 @@
 #>
 
 param(
-    [string]$StorageAccountName  = "yourstorageaccount",   # <-- UPDATE
+    [string]$StorageAccountName   = "yourstorageaccount",  # <-- UPDATE
     [string]$StorageResourceGroup = "your-rg-name",        # <-- UPDATE
-    [string]$ContainerName       = "quota-reports",         # <-- UPDATE
-    [string]$SubscriptionFilter  = ""  # Comma-separated sub IDs to limit scope; leave empty for ALL
+    [string]$ContainerName        = "quota-reports",        # <-- UPDATE
+    [string]$SubscriptionFilter   = ""  # Comma-separated sub IDs to limit scope; leave empty for ALL
 )
 
 # ──────────────────────────────────────────
@@ -29,10 +29,17 @@ try {
 }
 
 # ──────────────────────────────────────────
-# 2. Get target subscriptions
+# 2. Hardcoded target regions (East US + East US 2 only)
+# ──────────────────────────────────────────
+$targetRegions = @("eastus", "eastus2")
+Write-Output "Target regions: $($targetRegions -join ', ')"
+
+# ──────────────────────────────────────────
+# 3. Get all enabled subscriptions
 # ──────────────────────────────────────────
 Write-Output "Fetching subscriptions..."
-$allSubscriptions = Get-AzSubscription -WarningAction SilentlyContinue | Where-Object { $_.State -eq "Enabled" }
+$allSubscriptions = Get-AzSubscription -WarningAction SilentlyContinue | 
+    Where-Object { $_.State -eq "Enabled" }
 
 if ($SubscriptionFilter -ne "") {
     $filterList = $SubscriptionFilter -split "," | ForEach-Object { $_.Trim() }
@@ -42,17 +49,7 @@ if ($SubscriptionFilter -ne "") {
 Write-Output "Total subscriptions to process: $($allSubscriptions.Count)"
 
 # ──────────────────────────────────────────
-# 3. Get available Azure regions for vCPU usage API
-# ──────────────────────────────────────────
-# Use first subscription to enumerate available regions
-Set-AzContext -SubscriptionId $allSubscriptions[0].Id -WarningAction SilentlyContinue | Out-Null
-$computeProvider = Get-AzResourceProvider -ProviderNamespace Microsoft.Compute | 
-    Where-Object { $_.ResourceTypes.ResourceTypeName -eq "locations/usages" }
-$availableLocations = $computeProvider.Locations
-Write-Output "Scanning $($availableLocations.Count) regions per subscription."
-
-# ──────────────────────────────────────────
-# 4. Iterate subscriptions and collect vCPU quota data
+# 4. Iterate subscriptions → regions → vCPU quotas
 # ──────────────────────────────────────────
 $quotaReport = [System.Collections.Generic.List[PSCustomObject]]::new()
 $subIndex    = 0
@@ -65,14 +62,17 @@ foreach ($subscription in $allSubscriptions) {
     try {
         Set-AzContext -SubscriptionId $subscription.Id -WarningAction SilentlyContinue | Out-Null
     } catch {
-        Write-Warning "Could not set context for $($subscription.Name): $_"
+        Write-Warning "  Could not set context for '$($subscription.Name)': $_"
         continue
     }
 
-    foreach ($location in $availableLocations) {
+    foreach ($region in $targetRegions) {
         try {
-            $usages = Get-AzVMUsage -Location $location -ErrorAction SilentlyContinue
-            if (-not $usages) { continue }
+            $usages = Get-AzVMUsage -Location $region -ErrorAction SilentlyContinue
+            if (-not $usages) {
+                Write-Warning "  No usage data returned for region '$region' in '$($subscription.Name)'"
+                continue
+            }
 
             foreach ($usage in $usages) {
                 $currentValue = $usage.CurrentValue
@@ -83,7 +83,7 @@ foreach ($subscription in $allSubscriptions) {
                 $quotaReport.Add([PSCustomObject]@{
                     SubscriptionId   = $subscription.Id
                     SubscriptionName = $subscription.Name
-                    Region           = $location
+                    Region           = $region
                     QuotaName        = $usage.Name.LocalizedValue
                     QuotaNameCode    = $usage.Name.Value
                     CurrentUsage     = $currentValue
@@ -94,8 +94,9 @@ foreach ($subscription in $allSubscriptions) {
                     CollectedAt      = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
                 })
             }
+
         } catch {
-            Write-Warning "  Skipped region '$location' in '$($subscription.Name)': $_"
+            Write-Warning "  Skipped region '$region' in '$($subscription.Name)': $_"
         }
     }
 }
@@ -103,34 +104,34 @@ foreach ($subscription in $allSubscriptions) {
 Write-Output "Total quota records collected: $($quotaReport.Count)"
 
 # ──────────────────────────────────────────
-# 5. Export to CSV (in-memory temp path)
+# 5. Export to CSV (temp path)
 # ──────────────────────────────────────────
-$timestamp  = Get-Date -Format "yyyyMMdd-HHmmss"
-$csvFileName = "vCPU-Quota-Report-$timestamp.csv"
+$timestamp   = Get-Date -Format "yyyyMMdd-HHmmss"
+$csvFileName = "vCPU-Quota-EastUS-Report-$timestamp.csv"
 $tempPath    = "$env:TEMP\$csvFileName"
 
 $quotaReport | Export-Csv -Path $tempPath -NoTypeInformation -Encoding UTF8
-Write-Output "CSV exported to temp path: $tempPath"
+Write-Output "CSV written to temp: $tempPath  |  Rows: $($quotaReport.Count)"
 
 # ──────────────────────────────────────────
 # 6. Upload CSV to Azure Blob Storage
 # ──────────────────────────────────────────
-Write-Output "Uploading CSV to Storage Account: $StorageAccountName / Container: $ContainerName"
+Write-Output "Uploading to: $StorageAccountName / $ContainerName / $csvFileName"
 
 try {
-    # Use Managed Identity — no storage key required
+    # Managed Identity — no storage key or SAS needed
     $storageContext = New-AzStorageContext `
         -StorageAccountName $StorageAccountName `
         -UseConnectedAccount
 
-    # Ensure container exists
-    $container = Get-AzStorageContainer -Name $ContainerName -Context $storageContext -ErrorAction SilentlyContinue
-    if (-not $container) {
+    # Create container if it doesn't exist
+    $containerExists = Get-AzStorageContainer -Name $ContainerName -Context $storageContext -ErrorAction SilentlyContinue
+    if (-not $containerExists) {
         New-AzStorageContainer -Name $ContainerName -Context $storageContext -Permission Off | Out-Null
-        Write-Output "Created container: $ContainerName"
+        Write-Output "Container '$ContainerName' created."
     }
 
-    # Upload blob (overwrite if exists)
+    # Upload the CSV blob
     Set-AzStorageBlobContent `
         -File      $tempPath `
         -Container $ContainerName `
@@ -138,13 +139,13 @@ try {
         -Context   $storageContext `
         -Force | Out-Null
 
-    Write-Output "Successfully uploaded: $csvFileName to $StorageAccountName/$ContainerName"
+    Write-Output "Upload successful: $csvFileName"
 
 } catch {
-    throw "Failed to upload CSV to Blob Storage: $_"
+    throw "Blob upload failed: $_"
 } finally {
-    # Clean up temp file
     if (Test-Path $tempPath) { Remove-Item $tempPath -Force }
+    Write-Output "Temp file cleaned up."
 }
 
-Write-Output "Runbook completed successfully. File: $csvFileName"
+Write-Output "Runbook completed. Blob: $StorageAccountName/$ContainerName/$csvFileName"
